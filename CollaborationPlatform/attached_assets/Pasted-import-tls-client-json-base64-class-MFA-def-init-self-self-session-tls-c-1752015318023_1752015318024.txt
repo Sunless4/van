@@ -1,0 +1,452 @@
+import tls_client, json, base64
+
+class MFA:
+    def __init__(self):
+        self.session = tls_client.Session(client_identifier="chrome_128")
+        with open("config.json", "r") as config:
+            self.data = json.load(config)
+            self.vanity_code = self.data["vanity-code"]
+            self.password = self.data["password"]
+            self.token = self.data["token"]
+            self.guild_id = self.data["guild-id"]
+
+        with open("properties.txt", "r") as properties:
+            self.super_properties = "".join(properties.readline()).strip()
+    
+        self.ticket = self.get_mfa_ticket()
+        print(f"Ticket: {self.ticket}")
+        self.mfa_auth = self.get_vanity_token()
+        print(f"Vanity Token response: {self.mfa_auth}")
+
+    def get_mfa_ticket(self):
+        return self.session.patch(
+            f"https://discord.com/api/v9/guilds/{self.guild_id}/vanity-url",
+            headers={
+                "Authorization": self.token,
+                "x-super-properties": self.super_properties,
+            },
+            json={"code": self.vanity_code},
+        ).json()["mfa"]["ticket"]
+
+    def get_vanity_token(self):
+        return self.session.post(
+            "https://discord.com/api/v9/mfa/finish",
+            headers={
+                "Authorization": self.token,
+                "x-super-properties": self.super_properties,
+            },
+            json={"data": self.password, "mfa_type": "password", "ticket": self.ticket},
+        ).json()["token"]
+        
+    def set_vanity(self): # wont be called unless user wants to change vanity
+        return self.session.patch(f"https://discord.com/api/v9/guilds/{self.guild_id}/vanity-url", headers={
+            "Authorization": self.token,
+            "x-super-properties": self.super_properties,
+            "x-discord-mfa-authorization": self.mfa_auth,
+            "Cookie": f"__Secure-recent_mfa={self.mfa_auth};",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) discord/0.0.330 Chrome/128.0.6613.186 Electron/32.2.7 Safari/537.36"
+        }, json={"code": self.vanity_code}).json()
+
+
+init = MFA()
+const tls = require('tls');
+const WebSocket = require('ws');
+const fetch = require('node-fetch');
+const dotenv = require('dotenv');
+
+dotenv.config();
+
+const {
+  LISTENER_TOKEN,
+  CLAIMER_TOKEN,
+  CLAIMER_PASSWORD,
+  GUILD_IDS,
+  WEBHOOK_URL
+} = process.env;
+
+// Validate required environment variables
+if (!LISTENER_TOKEN || !CLAIMER_TOKEN) {
+  console.error('❌ Missing required environment variables. Please check your .env file.');
+  process.exit(1);
+}
+
+// Function to handle MFA for Discord requests
+function getMFACode() {
+  // Try backup codes first (most reliable)
+  const backupCodes = process.env.BACKUP_CODES ? process.env.BACKUP_CODES.split(',') : [];
+  if (backupCodes.length > 0) {
+    // Use and remove the first backup code
+    const code = backupCodes.shift().trim();
+    process.env.BACKUP_CODES = backupCodes.join(',');
+    return code;
+  }
+  
+  // Fallback to password if no backup codes
+  return process.env.MFA_PASSWORD || null;
+}
+
+// Guild IDs for claiming (optional - will monitor all guilds the listener token is in)
+const targetGuildIds = GUILD_IDS ? GUILD_IDS.split(',').map(id => id.trim()) : [];
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// Send webhook notification
+async function sendWebhook(title, description) {
+  if (!WEBHOOK_URL) {
+    log('⚠️ No webhook URL configured, skipping notification');
+    return;
+  }
+  
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        embeds: [{
+          title,
+          description,
+          color: 0x00FF00,
+          timestamp: new Date().toISOString()
+        }]
+      })
+    });
+    log(`📢 Webhook sent: ${title}`);
+  } catch (err) {
+    log(`❌ Webhook failed: ${err.message}`);
+  }
+}
+
+// Raw TLS request to Discord with MFA support
+function tlsPatch(path, body, token, mfaCode = null) {
+  return new Promise((resolve, reject) => {
+    // MFA handling is now done in the body object directly
+    
+    const data = JSON.stringify(body);
+    const request = [
+      `PATCH ${path} HTTP/1.1`,
+      `Host: discord.com`,
+      `Authorization: ${token}`,
+      `Content-Type: application/json`,
+      `Content-Length: ${Buffer.byteLength(data)}`,
+      `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36`,
+      `X-Super-Properties: eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzkwLjAuNDQzMC4yMTIgU2FmYXJpLzUzNy4zNiIsImJyb3dzZXJfdmVyc2lvbiI6IjkwLjAuNDQzMC4yMTIiLCJvcyI6IldpbmRvd3MiLCJvcyI6IldpbmRvd3MiLCJyZWZlcnJlciI6IiIsInJlZmVycmluZ19kb21haW4iOiIiLCJyZWZlcnJlcl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVsZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6OTk5OTl9`,
+      '',
+      data
+    ].join('\r\n');
+
+    const socket = tls.connect(443, 'discord.com', { 
+      servername: 'discord.com',
+      timeout: 5000
+    }, () => {
+      socket.write(request);
+    });
+
+    let response = '';
+    socket.on('data', chunk => response += chunk);
+    socket.on('end', () => resolve(response));
+    socket.on('error', reject);
+    socket.on('timeout', () => {
+      socket.destroy();
+      reject(new Error('TLS connection timeout'));
+    });
+  });
+}
+
+// Attempt to claim the vanity
+async function attemptClaim(guildId, code, retries = 3) {
+  log(`🚀 Trying to claim: ${code} on guild ${guildId}`);
+
+  const path = `/api/v10/guilds/${guildId}/vanity-url`;
+  for (let i = 1; i <= retries; i++) {
+    try {
+      let mfaCode = null;
+      let res = await tlsPatch(path, { code }, CLAIMER_TOKEN, mfaCode);
+      let statusLine = res.split('\r\n')[0];
+      
+      // Check if MFA is required
+      if (res.includes('60003')) {
+        log(`🔐 MFA required for claiming ${code}`);
+        
+        // Extract MFA ticket from response
+        const mfaMatch = res.match(/"ticket":"([^"]+)"/);
+        if (mfaMatch && process.env.MFA_PASSWORD) {
+          const mfaTicket = mfaMatch[1];
+          log(`🔑 Retrying with MFA password`);
+          
+          // Use HTTP for MFA since TLS might be causing issues
+          try {
+            const mfaResponse = await fetch(`https://discord.com/api/v10/guilds/${guildId}/vanity-url`, {
+              method: 'PATCH',
+              headers: {
+                'Authorization': CLAIMER_TOKEN,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'X-Super-Properties': 'eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzkwLjAuNDQzMC4yMTIgU2FmYXJpLzUzNy4zNiIsImJyb3dzZXJfdmVyc2lvbiI6IjkwLjAuNDQzMC4yMTIiLCJvcyI6IldpbmRvd3MiLCJvcyI6IldpbmRvd3MiLCJyZWZlcnJlciI6IiIsInJlZmVycmluZ19kb21haW4iOiIiLCJyZWZlcnJlcl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVsZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6OTk5OTl9'
+              },
+              body: JSON.stringify({
+                code,
+                mfa_code: process.env.MFA_PASSWORD,
+                mfa_ticket: mfaTicket
+              })
+            });
+            
+            if (mfaResponse.ok) {
+              log(`✅ Successfully claimed vanity ${code} with MFA on guild ${guildId}`);
+              await sendWebhook('Vanity Claimed Successfully', `Code: **${code}**\nGuild: ${guildId}\nUsed MFA authentication`);
+              return true;
+            } else {
+              const errorText = await mfaResponse.text();
+              log(`❌ MFA claim failed: ${mfaResponse.status} - ${errorText}`);
+            }
+          } catch (mfaError) {
+            log(`❌ MFA request error: ${mfaError.message}`);
+          }
+          
+          break;
+        } else {
+          log(`❌ No MFA password available - cannot claim ${code}`);
+          await sendWebhook('MFA Required', `Cannot claim **${code}** - MFA password needed`);
+          break;
+        }
+      }
+      
+      if (res.includes('200 OK')) {
+        log(`✅ Successfully claimed vanity ${code} on guild ${guildId}`);
+        await sendWebhook('Vanity Claimed Successfully', `Code: **${code}**\nGuild: ${guildId}\nAttempt: ${i}/${retries}`);
+        return true;
+      } else if (res.includes('400 Bad Request')) {
+        log(`❌ Bad request for ${code} - code may be invalid or unavailable`);
+        break; // Don't retry bad requests
+      } else if (res.includes('401 Unauthorized')) {
+        log(`❌ Unauthorized - check CLAIMER_TOKEN`);
+        break; // Don't retry auth errors
+      } else if (res.includes('403 Forbidden')) {
+        log(`❌ Forbidden - insufficient permissions for guild ${guildId}`);
+        break; // Don't retry permission errors
+      } else if (res.includes('429 Too Many Requests')) {
+        log(`⏱️ Rate limited - waiting longer before retry`);
+        await new Promise(res => setTimeout(res, 2000)); // Wait longer for rate limits
+      } else {
+        log(`❌ Attempt ${i} failed — ${statusLine}`);
+      }
+    } catch (err) {
+      log(`⚠️ Claim error (attempt ${i}): ${err.message}`);
+    }
+    
+    if (i < retries) {
+      await new Promise(res => setTimeout(res, 750)); // wait before retry
+    }
+  }
+  
+  log(`❌ Failed to claim ${code} after ${retries} attempts`);
+  await sendWebhook('Vanity Claim Failed', `Code: **${code}**\nGuild: ${guildId}\nFailed after ${retries} attempts`);
+  return false;
+}
+
+// Monitor for vanity changes
+function monitorVanityChanges(oldVanity, newVanity, guildId, allGuilds) {
+  if (oldVanity && !newVanity) {
+    // Vanity was dropped
+    log(`🕳️ Vanity '${oldVanity}' dropped in guild ${guildId}`);
+    sendWebhook('Vanity Dropped', `Guild ${guildId} dropped vanity: **${oldVanity}**`);
+    // Attempt to claim the dropped vanity on target guilds
+    const guildsToTry = targetGuildIds.length > 0 ? targetGuildIds : allGuilds.map(g => g.id);
+    guildsToTry.forEach(async (targetGuildId) => {
+      if (targetGuildId !== guildId) {
+        await attemptClaim(targetGuildId, oldVanity, 5);
+      }
+    });
+  } else if (!oldVanity && newVanity) {
+    // New vanity was set
+    log(`✨ New vanity '${newVanity}' set in guild ${guildId}`);
+    sendWebhook('New Vanity Set', `Guild ${guildId} set new vanity: **${newVanity}**`);
+  } else if (oldVanity && newVanity && oldVanity !== newVanity) {
+    // Vanity was changed
+    log(`🔄 Vanity changed from '${oldVanity}' to '${newVanity}' in guild ${guildId}`);
+    sendWebhook('Vanity Changed', `Guild ${guildId} changed vanity from **${oldVanity}** to **${newVanity}**`);
+    // Attempt to claim the old vanity on target guilds
+    const guildsToTry = targetGuildIds.length > 0 ? targetGuildIds : allGuilds.map(g => g.id);
+    guildsToTry.forEach(async (targetGuildId) => {
+      if (targetGuildId !== guildId) {
+        await attemptClaim(targetGuildId, oldVanity, 5);
+      }
+    });
+  }
+}
+
+// Store guild states for comparison
+const guildStates = new Map();
+let allGuilds = [];
+let isConnected = false;
+
+// Start listener
+function startListener() {
+  if (isConnected) {
+    log('⚠️ Already connected, skipping duplicate connection attempt');
+    return;
+  }
+  
+  const ws = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
+  let heartbeatInterval;
+  let sequence = null;
+  let isReconnecting = false;
+
+  ws.on('open', () => {
+    log('📡 Listener connected to Discord Gateway');
+    isConnected = true;
+    ws.send(JSON.stringify({
+      op: 2,
+      d: {
+        token: LISTENER_TOKEN,
+        intents: 1 << 5, // GUILD_UPDATES intent
+        properties: { 
+          os: 'linux', 
+          browser: 'discord.js', 
+          device: 'discord.js' 
+        }
+      }
+    }));
+  });
+
+  ws.on('message', async data => {
+    try {
+      const msg = JSON.parse(data);
+      
+      // Handle heartbeat
+      if (msg.op === 10) {
+        const heartbeatMs = msg.d.heartbeat_interval;
+        log(`💓 Setting up heartbeat every ${heartbeatMs}ms`);
+        
+        heartbeatInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ op: 1, d: sequence }));
+          }
+        }, heartbeatMs);
+      }
+
+      // Update sequence number
+      if (msg.s) {
+        sequence = msg.s;
+      }
+
+      // Handle READY event
+      if (msg.t === 'READY' && msg.op === 0) {
+        log(`✅ Bot ready as ${msg.d.user.username}#${msg.d.user.discriminator}`);
+        allGuilds = msg.d.guilds;
+        log(`👁️ Monitoring ${allGuilds.length} guild(s) that the listener token has access to`);
+        await sendWebhook('Sniper Started', `Monitoring ${allGuilds.length} guilds for vanity changes`);
+        
+        // Initialize guild states for all guilds the bot has access to
+        allGuilds.forEach(guild => {
+          guildStates.set(guild.id, {
+            vanity: guild.vanity_url_code,
+            name: guild.name
+          });
+          log(`📋 Initialized guild ${guild.name} (${guild.id}) with vanity: ${guild.vanity_url_code || 'none'}`);
+        });
+      }
+
+      // Handle guild updates
+      if (msg.t === 'GUILD_UPDATE' && msg.op === 0) {
+        const guild = msg.d;
+        
+        // Monitor all guilds the listener token has access to
+        const oldState = guildStates.get(guild.id);
+        const newVanity = guild.vanity_url_code;
+        
+        log(`🔄 Guild update received: ${guild.name} (${guild.id}) - Vanity: ${newVanity || 'none'}`);
+        
+        if (oldState) {
+          const oldVanity = oldState.vanity;
+          log(`📊 Comparing vanities: "${oldVanity}" vs "${newVanity}"`);
+          if (oldVanity !== newVanity) {
+            log(`🚨 Vanity change detected in ${guild.name}: ${oldVanity || 'none'} -> ${newVanity || 'none'}`);
+            monitorVanityChanges(oldVanity, newVanity, guild.id, allGuilds);
+          } else {
+            log(`✅ No vanity change detected`);
+          }
+        } else {
+          log(`⚠️ No previous state found for guild ${guild.id}`);
+        }
+
+        // Update stored state
+        guildStates.set(guild.id, {
+          vanity: newVanity,
+          name: guild.name
+        });
+      }
+
+    } catch (err) {
+      log(`⚠️ Error processing message: ${err.message}`);
+    }
+  });
+
+  ws.on('close', (code, reason) => {
+    log(`🔌 Listener disconnected (${code}: ${reason ? reason.toString() : 'Unknown reason'}). Reconnecting in 3 seconds...`);
+    isConnected = false;
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+    }
+    if (!isReconnecting) {
+      isReconnecting = true;
+      setTimeout(() => {
+        isReconnecting = false;
+        startListener();
+      }, 3000);
+    }
+  });
+
+  ws.on('error', err => {
+    log(`⚠️ WebSocket error: ${err.message}`);
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+    }
+    ws.close();
+  });
+}
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  log('🛑 Received SIGINT, shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  log('🛑 Received SIGTERM, shutting down gracefully...');
+  process.exit(0);
+});
+
+// Test claimer token
+async function testClaimerToken() {
+  try {
+    const testResponse = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: {
+        'Authorization': CLAIMER_TOKEN,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (testResponse.ok) {
+      const userData = await testResponse.json();
+      log(`✅ Claimer token valid - Bot: ${userData.username}#${userData.discriminator}`);
+    } else {
+      log(`❌ Claimer token invalid - Status: ${testResponse.status}`);
+    }
+  } catch (err) {
+    log(`❌ Error testing claimer token: ${err.message}`);
+  }
+}
+
+// Start the application
+log('🚀 Starting Discord vanity sniper...');
+if (targetGuildIds.length > 0) {
+  log(`🎯 Target guilds for claiming: ${targetGuildIds.join(', ')}`);
+} else {
+  log('🎯 Will attempt to claim vanity URLs on all monitored guilds');
+}
+
+// Test claimer token before starting
+testClaimerToken();
+startListener(); make these two work together 

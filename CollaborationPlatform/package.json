@@ -1,0 +1,20 @@
+{
+  "name": "workspace",
+  "version": "1.0.0",
+  "description": "A comprehensive Node.js application that monitors Discord guilds for vanity URL changes and automatically attempts to claim dropped vanity URLs with MFA authentication support.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.2.0",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.18.3"
+  }
+}
